@@ -261,6 +261,34 @@ let report = atosl::symbolize_path(&SymbolizeOptions {
 
 返回的 `SymbolizeReport` 保留了所选切片、每个地址的解析器选择、查找地址、符号名，以及可选的源码位置。
 
+### 复用已加载的目标文件
+
+`symbolize_path` 每次调用都会重新加载、解析并索引目标文件。如果需要对同一个目标文件
+反复符号化（例如一个处理同一构建崩溃报告的服务），这部分准备工作会占据大部分开销。
+`ObjectSymbolizer` 只做一次：
+
+```rust
+use atosl::{ObjectSymbolizer, SymbolizeOptions};
+
+let symbolizer = ObjectSymbolizer::open(&SymbolizeOptions {
+    object_path: "MyApp.app.dSYM".into(),
+    arch: Some("arm64".to_string()),
+    ..Default::default()
+})?;
+
+for address in [0x1000_1234, 0x1000_5678] {
+    let outcome = symbolizer.symbolize(0x1000_0000, address, false);
+    println!("{outcome:?}");
+}
+```
+
+`open` 只使用 `SymbolizeOptions` 中选择目标文件的字段（`object_path`、`arch`、`uuid`、
+`debug_dirs`、`verbose`）；加载地址和文件偏移模式在每次查找时传入。相同输入下，结果与
+`symbolize_path` 一致。
+
+DWARF 上下文在首次用到某个编译单元时才解析它，因此查找的范围越大，符号化器占用的内存越多。
+`ObjectSymbolizer` 实现了 `Send` 但没有实现 `Sync`；需要在线程间共享时，请用 `Mutex` 包装。
+
 ## 回归测试资产
 
 苹果特定行为由签入到 `tests/golden/apple/` 的黄金文件保护：

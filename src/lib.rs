@@ -27,6 +27,6 @@ pub mod atosl;
 pub mod demangle;
 
 pub use atosl::{
-    InlineFrame, OutputFormat, ResolverKind, SelectedSlice, SourceLocation, SymbolizeOptions,
-    SymbolizeOutcome, SymbolizeReport, SymbolizedFrame,
+    InlineFrame, ObjectSymbolizer, OutputFormat, ResolverKind, SelectedSlice, SourceLocation,
+    SymbolizeOptions, SymbolizeOutcome, SymbolizeReport, SymbolizedFrame,
 };

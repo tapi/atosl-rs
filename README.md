@@ -266,6 +266,35 @@ releases add new optional fields to `SymbolizeOptions`.
 
 The returned `SymbolizeReport` preserves the selected slice, per-address resolver choice, lookup address, symbol name, and optional source location.
 
+### Reusing a loaded object
+
+`symbolize_path` loads, parses, and indexes the object on every call. When the
+same object is symbolized many times, such as a service handling crash reports
+for one build, that setup dominates. `ObjectSymbolizer` does it once:
+
+```rust
+use atosl::{ObjectSymbolizer, SymbolizeOptions};
+
+let symbolizer = ObjectSymbolizer::open(&SymbolizeOptions {
+    object_path: "MyApp.app.dSYM".into(),
+    arch: Some("arm64".to_string()),
+    ..Default::default()
+})?;
+
+for address in [0x1000_1234, 0x1000_5678] {
+    let outcome = symbolizer.symbolize(0x1000_0000, address, false);
+    println!("{outcome:?}");
+}
+```
+
+`open` uses the object-selection fields of `SymbolizeOptions` (`object_path`,
+`arch`, `uuid`, `debug_dirs`, `verbose`); the load address and file-offset mode
+are passed per lookup. Results match `symbolize_path` for the same inputs.
+
+The DWARF context parses compilation units on first use, so a symbolizer's
+memory grows as more of the object is looked up. `ObjectSymbolizer` is `Send`
+but not `Sync`; wrap it in a `Mutex` to share it between threads.
+
 ## Regression assets
 
 Apple-specific behavior is protected by checked-in goldens under `tests/golden/apple/`:

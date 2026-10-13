@@ -21,6 +21,7 @@ clap = { version = "4.5.32", features = ["derive"] }
 gimli = "0.32.0"
 memmap2 = "0.9.10"
 object = "0.28.1"
+self_cell = "1.2.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 symbolic-common = "13.0.0"

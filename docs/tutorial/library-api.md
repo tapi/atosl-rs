@@ -82,6 +82,40 @@ resolver that produced it (`dwarf` or `symbol_table`), the optional source
 > The report always contains the full inline chain in `inlined_by`, regardless
 > of the `inline_frames` flag — that flag only affects the CLI's text rendering.
 
+## Reuse a loaded object
+
+`symbolize_path` loads, parses, and indexes the object on every call. A
+long-running caller that symbolizes the same object repeatedly can do that once
+with `ObjectSymbolizer` and pay only the per-address lookup afterwards:
+
+```rust
+use atosl::{ObjectSymbolizer, SymbolizeOptions};
+
+let symbolizer = ObjectSymbolizer::open(&SymbolizeOptions {
+    object_path: "MyApp.app.dSYM".into(),
+    arch: Some("arm64".to_string()),
+    ..Default::default()
+})?;
+
+for address in [0x1_0000_1234, 0x1_0000_5678] {
+    let outcome = symbolizer.symbolize(0x1_0000_0000, address, false);
+    println!("{outcome:?}");
+}
+# Ok::<(), anyhow::Error>(())
+```
+
+- `open` uses the object-selection fields (`object_path`, `arch`, `uuid`,
+  `debug_dirs`, `verbose`). `load_address` and `file_offsets` are passed to each
+  `symbolize` call instead; `addresses`, `format`, `input`, and `inline_frames`
+  are ignored.
+- Each call returns the same `SymbolizeOutcome` that `symbolize_path` would for
+  that address. `object_path()`, `object_name()`, and `selected_slice()` give
+  the report-level fields.
+- Compilation units are parsed on first use, so memory grows as more of the
+  object is looked up. Bound how many symbolizers you cache.
+- `ObjectSymbolizer` is `Send` but not `Sync`. Wrap it in a `Mutex` to share it
+  between threads.
+
 ## Stability
 
 `SymbolizeOptions` deriving `Default` means new optional fields can be added

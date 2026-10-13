@@ -1,4 +1,4 @@
-use atosl::{atosl, OutputFormat, SymbolizeOptions};
+use atosl::{atosl, ObjectSymbolizer, OutputFormat, SymbolizeOptions};
 use criterion::{criterion_group, criterion_main, Criterion};
 use object::{Object, ObjectSection, ObjectSymbol};
 use std::fs;
@@ -26,6 +26,21 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let report = atosl::symbolize_path(&options).expect("symbolize");
             assert_eq!(report.frames.len(), options.addresses.len());
+        });
+    });
+
+    // The same lookups against an object opened once, as a long-running caller
+    // would do: only the per-address cost remains.
+    let symbolizer = ObjectSymbolizer::open(&options).expect("open");
+    c.bench_function("symbolize_64_addresses_reused", |b| {
+        b.iter(|| {
+            for &address in &options.addresses {
+                std::hint::black_box(symbolizer.symbolize(
+                    options.load_address,
+                    address,
+                    options.file_offsets,
+                ));
+            }
         });
     });
 }

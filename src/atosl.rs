@@ -135,48 +135,38 @@ pub fn run(options: SymbolizeOptions) -> Result<i32> {
 }
 
 pub fn symbolize_path(options: &SymbolizeOptions) -> Result<SymbolizeReport> {
-    with_symbolizer(options, |symbolizer, object_path, selected_slice| {
-        let frames = options
-            .addresses
-            .iter()
-            .copied()
-            .map(|requested_address| {
-                symbolizer.symbolize(
-                    options.load_address,
-                    requested_address,
-                    options.file_offsets,
-                )
-            })
-            .collect();
+    let symbolizer = ObjectSymbolizer::open(options)?;
+    let frames = options
+        .addresses
+        .iter()
+        .copied()
+        .map(|requested_address| {
+            symbolizer.symbolize(
+                options.load_address,
+                requested_address,
+                options.file_offsets,
+            )
+        })
+        .collect();
 
-        SymbolizeReport {
-            object_path,
-            object_name: symbolizer.object_name.to_string(),
-            selected_slice,
-            frames,
-        }
-    })
+    Ok(symbolizer.report(frames))
 }
 
 fn run_streaming(options: &SymbolizeOptions) -> Result<i32> {
-    with_symbolizer(
-        options,
-        |symbolizer, object_path, selected_slice| -> Result<i32> {
-            if options.format == OutputFormat::Text && options.verbose {
-                emit_text_header(&object_path, selected_slice.as_ref());
-            }
-            for_each_input_address(options.input.as_deref(), |parsed| {
-                let outcome = symbolizer.symbolize_parsed(options, parsed);
-                emit_streaming_outcome(
-                    &outcome,
-                    options.format,
-                    options.verbose,
-                    options.inline_frames,
-                );
-            })?;
-            Ok(0)
-        },
-    )?
+    let symbolizer = ObjectSymbolizer::open(options)?;
+    if options.format == OutputFormat::Text && options.verbose {
+        emit_text_header(symbolizer.object_path(), symbolizer.selected_slice());
+    }
+    for_each_input_address(options.input.as_deref(), |parsed| {
+        let outcome = symbolize_parsed(&symbolizer, options, parsed);
+        emit_streaming_outcome(
+            &outcome,
+            options.format,
+            options.verbose,
+            options.inline_frames,
+        );
+    })?;
+    Ok(0)
 }
 
 fn emit_streaming_outcome(
@@ -192,23 +182,13 @@ fn emit_streaming_outcome(
 }
 
 fn run_collected_input(options: &SymbolizeOptions) -> Result<i32> {
-    let report = with_symbolizer(
-        options,
-        |symbolizer, object_path, selected_slice| -> Result<SymbolizeReport> {
-            let mut frames = Vec::new();
-            for_each_input_address(options.input.as_deref(), |parsed| {
-                frames.push(symbolizer.symbolize_parsed(options, parsed));
-            })?;
-            Ok(SymbolizeReport {
-                object_path,
-                object_name: symbolizer.object_name.to_string(),
-                selected_slice,
-                frames,
-            })
-        },
-    )??;
+    let symbolizer = ObjectSymbolizer::open(options)?;
+    let mut frames = Vec::new();
+    for_each_input_address(options.input.as_deref(), |parsed| {
+        frames.push(symbolize_parsed(&symbolizer, options, parsed));
+    })?;
     emit_report(
-        &report,
+        &symbolizer.report(frames),
         options.format,
         options.verbose,
         options.inline_frames,
@@ -216,117 +196,241 @@ fn run_collected_input(options: &SymbolizeOptions) -> Result<i32> {
     Ok(0)
 }
 
-struct Symbolizer<'a> {
-    object_name: &'a str,
-    context: Option<&'a DwarfContext<'a>>,
-    symbol_map: &'a SymbolMap<SymbolMapName<'a>>,
-    text_vmaddr: u64,
+fn symbolize_parsed(
+    symbolizer: &ObjectSymbolizer,
+    options: &SymbolizeOptions,
+    parsed: Result<u64, String>,
+) -> SymbolizeOutcome {
+    match parsed {
+        Ok(address) => symbolizer.symbolize(options.load_address, address, options.file_offsets),
+        Err(error) => SymbolizeOutcome::Unresolved {
+            requested_address: 0,
+            error,
+        },
+    }
 }
 
-impl Symbolizer<'_> {
-    fn symbolize(
+/// An object file loaded once and kept ready for repeated lookups.
+///
+/// [`symbolize_path`] opens the object, builds its symbol map and DWARF
+/// context, resolves the given addresses, and drops everything. When the same
+/// object is symbolized repeatedly (a long-running service handling many
+/// crash reports for one build, say), that setup dominates the cost of each
+/// call. `ObjectSymbolizer` does the setup in [`open`](Self::open) and keeps
+/// the result, so each [`symbolize`](Self::symbolize) call only pays for the
+/// lookup.
+///
+/// The DWARF context parses compilation units lazily, so memory grows as more
+/// of the object is looked up. Callers caching several symbolizers should bound
+/// how many they keep.
+///
+/// `ObjectSymbolizer` is `Send` but not `Sync`: the DWARF context fills in its
+/// per-unit caches through interior mutability. Share one across threads by
+/// wrapping it in a `Mutex`.
+///
+/// ```no_run
+/// use atosl::{ObjectSymbolizer, SymbolizeOptions};
+///
+/// let symbolizer = ObjectSymbolizer::open(&SymbolizeOptions {
+///     object_path: "MyApp.app.dSYM/Contents/Resources/DWARF/MyApp".into(),
+///     arch: Some("arm64".to_string()),
+///     ..Default::default()
+/// })?;
+///
+/// for address in [0x1000_1234, 0x1000_5678] {
+///     println!("{:?}", symbolizer.symbolize(0x1000_0000, address, false));
+/// }
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub struct ObjectSymbolizer {
+    object_path: String,
+    indexed: IndexedObject,
+}
+
+impl ObjectSymbolizer {
+    /// Opens, parses, and indexes the object described by `options`.
+    ///
+    /// Uses `object_path`, `arch`, `uuid`, `debug_dirs`, and `verbose`. The
+    /// per-lookup fields (`load_address`, `addresses`, `file_offsets`) and the
+    /// output fields are ignored; pass the lookup values to
+    /// [`symbolize`](Self::symbolize) instead.
+    pub fn open(options: &SymbolizeOptions) -> Result<Self> {
+        let object_path = resolve_object_path(
+            &options.object_path,
+            options.uuid.as_deref(),
+            &options.debug_dirs,
+        )?;
+        if options.verbose && object_path != options.object_path {
+            eprintln!("resolved_object: {}", object_path.display());
+        }
+        let file = fs::File::open(&object_path)
+            .with_context(|| format!("failed to open object file: {}", object_path.display()))?;
+        // SAFETY: the mapping is only read. As with any mmap, the file must not
+        // be truncated or modified while the symbolizer is alive.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .with_context(|| format!("failed to memory-map: {}", object_path.display()))?;
+
+        let uuid_filter = match options.uuid.as_deref() {
+            Some(value) => parse_uuid_filter(value)?,
+            None => None,
+        };
+        let mapped = MappedObject::try_new(mmap, |mmap| {
+            LoadedObject::load(
+                mmap,
+                &object_path,
+                options.arch.as_deref(),
+                uuid_filter,
+                options.verbose,
+            )
+        })?;
+        let indexed = IndexedObject::try_new(mapped, |mapped| mapped.borrow_dependent().index())?;
+
+        Ok(Self {
+            object_path: object_path.display().to_string(),
+            indexed,
+        })
+    }
+
+    /// Resolves one address. `load_address` and `file_offsets` have the same
+    /// meaning as in [`SymbolizeOptions`].
+    pub fn symbolize(
         &self,
         load_address: u64,
         requested_address: u64,
         file_offsets: bool,
     ) -> SymbolizeOutcome {
-        symbolize_address(
-            self.object_name,
-            self.context,
-            self.symbol_map,
-            load_address,
-            requested_address,
-            self.text_vmaddr,
-            file_offsets,
-        )
+        self.indexed.with_dependent(|mapped, context| {
+            let loaded = mapped.borrow_dependent();
+            symbolize_address(
+                &loaded.object_name,
+                context.as_ref(),
+                &loaded.symbol_map,
+                load_address,
+                requested_address,
+                loaded.text_vmaddr,
+                file_offsets,
+            )
+        })
     }
 
-    fn symbolize_parsed(
-        &self,
-        options: &SymbolizeOptions,
-        parsed: Result<u64, String>,
-    ) -> SymbolizeOutcome {
-        match parsed {
-            Ok(address) => self.symbolize(options.load_address, address, options.file_offsets),
-            Err(error) => SymbolizeOutcome::Unresolved {
-                requested_address: 0,
-                error,
-            },
+    /// The path that was opened, after resolving dSYM bundles and separate
+    /// debug files.
+    pub fn object_path(&self) -> &str {
+        &self.object_path
+    }
+
+    /// The object's file name, as reported in each frame.
+    pub fn object_name(&self) -> &str {
+        &self.indexed.borrow_owner().borrow_dependent().object_name
+    }
+
+    /// The Mach-O slice that was selected, if the object is Mach-O.
+    pub fn selected_slice(&self) -> Option<&SelectedSlice> {
+        self.indexed
+            .borrow_owner()
+            .borrow_dependent()
+            .selected_slice
+            .as_ref()
+    }
+
+    fn report(&self, frames: Vec<SymbolizeOutcome>) -> SymbolizeReport {
+        SymbolizeReport {
+            object_path: self.object_path().to_string(),
+            object_name: self.object_name().to_string(),
+            selected_slice: self.selected_slice().cloned(),
+            frames,
         }
     }
 }
 
-// Loads the object and DWARF context once, then hands a reusable symbolizer to
-// `body`. Keeping the borrowed state inside one stack frame avoids a
-// self-referential struct (the context borrows the sections, which borrow the
-// mmap).
-fn with_symbolizer<T>(
-    options: &SymbolizeOptions,
-    body: impl FnOnce(&Symbolizer<'_>, String, Option<SelectedSlice>) -> T,
-) -> Result<T> {
-    let object_path = resolve_object_path(
-        &options.object_path,
-        options.uuid.as_deref(),
-        &options.debug_dirs,
-    )?;
-    if options.verbose && object_path != options.object_path {
-        eprintln!("resolved_object: {}", object_path.display());
+impl std::fmt::Debug for ObjectSymbolizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectSymbolizer")
+            .field("object_path", &self.object_path)
+            .field("object_name", &self.object_name())
+            .field("selected_slice", &self.selected_slice())
+            .finish_non_exhaustive()
     }
-    let file = fs::File::open(&object_path)
-        .with_context(|| format!("failed to open object file: {}", object_path.display()))?;
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .with_context(|| format!("failed to memory-map: {}", object_path.display()))?;
-
-    let parsed_uuid_filter = match options.uuid.as_deref() {
-        Some(value) => parse_uuid_filter(value)?,
-        None => None,
-    };
-    let resolved = resolve_object_from_data(
-        &mmap,
-        &object_path,
-        options.arch.as_deref(),
-        parsed_uuid_filter,
-        options.verbose,
-    )?;
-
-    let endian = if resolved.object.is_little_endian() {
-        RunTimeEndian::Little
-    } else {
-        RunTimeEndian::Big
-    };
-    let text_vmaddr = find_text_vmaddr(&resolved.object)?;
-    let symbol_map = resolved.object.symbol_map();
-
-    let dwarf_sections = if is_object_dwarf(&resolved.object) {
-        Some(load_dwarf_sections(&resolved.object)?)
-    } else {
-        None
-    };
-    let context = match &dwarf_sections {
-        Some(sections) => {
-            let mut dwarf = sections.borrow(|section| EndianSlice::new(section.as_ref(), endian));
-            // dsymutil emits a single abbreviation table shared by every unit.
-            // Without the cache, gimli re-parses and keeps a separate copy of it
-            // per unit, which dominates context construction on large dSYMs.
-            dwarf.populate_abbreviations_cache(gimli::AbbreviationsCacheStrategy::Duplicates);
-            Some(DwarfContext::from_dwarf(dwarf).context("failed to build DWARF context")?)
-        }
-        None => None,
-    };
-
-    let symbolizer = Symbolizer {
-        object_name: &resolved.object_name,
-        context: context.as_ref(),
-        symbol_map: &symbol_map,
-        text_vmaddr,
-    };
-
-    Ok(body(
-        &symbolizer,
-        object_path.display().to_string(),
-        resolved.selected_slice.clone(),
-    ))
 }
+
+// The DWARF context borrows the sections, which borrow the mapped file, so an
+// owned symbolizer needs two self-referential layers. `MappedObject` owns the
+// mapping and the data parsed from it; `IndexedObject` owns that and the DWARF
+// context built over its sections.
+struct LoadedObject<'data> {
+    object_name: String,
+    selected_slice: Option<SelectedSlice>,
+    endian: RunTimeEndian,
+    text_vmaddr: u64,
+    symbol_map: SymbolMap<SymbolMapName<'data>>,
+    dwarf_sections: Option<gimli::DwarfSections<borrow::Cow<'data, [u8]>>>,
+}
+
+impl<'data> LoadedObject<'data> {
+    fn load(
+        data: &'data [u8],
+        object_path: &Path,
+        arch_filter: Option<&str>,
+        uuid_filter: Option<[u8; 16]>,
+        verbose: bool,
+    ) -> Result<Self> {
+        let resolved =
+            resolve_object_from_data(data, object_path, arch_filter, uuid_filter, verbose)?;
+        let endian = if resolved.object.is_little_endian() {
+            RunTimeEndian::Little
+        } else {
+            RunTimeEndian::Big
+        };
+        let dwarf_sections = if is_object_dwarf(&resolved.object) {
+            Some(load_dwarf_sections(&resolved.object)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            text_vmaddr: find_text_vmaddr(&resolved.object)?,
+            symbol_map: resolved.object.symbol_map(),
+            object_name: resolved.object_name,
+            selected_slice: resolved.selected_slice,
+            endian,
+            dwarf_sections,
+        })
+    }
+
+    fn index(&self) -> Result<Option<DwarfContext<'_>>> {
+        let Some(sections) = &self.dwarf_sections else {
+            return Ok(None);
+        };
+        let mut dwarf = sections.borrow(|section| EndianSlice::new(section.as_ref(), self.endian));
+        // dsymutil emits a single abbreviation table shared by every unit.
+        // Without the cache, gimli re-parses and keeps a separate copy of it
+        // per unit, which dominates context construction on large dSYMs.
+        dwarf.populate_abbreviations_cache(gimli::AbbreviationsCacheStrategy::Duplicates);
+        Ok(Some(
+            DwarfContext::from_dwarf(dwarf).context("failed to build DWARF context")?,
+        ))
+    }
+}
+
+type OptionalDwarfContext<'a> = Option<DwarfContext<'a>>;
+
+self_cell::self_cell!(
+    struct MappedObject {
+        owner: memmap2::Mmap,
+
+        #[covariant]
+        dependent: LoadedObject,
+    }
+);
+
+self_cell::self_cell!(
+    struct IndexedObject {
+        owner: MappedObject,
+
+        #[not_covariant]
+        dependent: OptionalDwarfContext,
+    }
+);
 
 fn for_each_input_address(
     input: Option<&Path>,

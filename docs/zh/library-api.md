@@ -73,6 +73,31 @@ pub struct SymbolizeReport {
 
 > 无论 `inline_frames` 标志如何，报告的 `inlined_by` 中始终包含完整的内联链——该标志只影响 CLI 的文本渲染。
 
+## 复用已加载的目标文件
+
+`symbolize_path` 每次调用都会重新加载、解析并索引目标文件。需要反复符号化同一个目标文件的长期运行程序，可以用 `ObjectSymbolizer` 只做一次准备工作，之后每个地址只需付出查找本身的开销：
+
+```rust
+use atosl::{ObjectSymbolizer, SymbolizeOptions};
+
+let symbolizer = ObjectSymbolizer::open(&SymbolizeOptions {
+    object_path: "MyApp.app.dSYM".into(),
+    arch: Some("arm64".to_string()),
+    ..Default::default()
+})?;
+
+for address in [0x1_0000_1234, 0x1_0000_5678] {
+    let outcome = symbolizer.symbolize(0x1_0000_0000, address, false);
+    println!("{outcome:?}");
+}
+# Ok::<(), anyhow::Error>(())
+```
+
+- `open` 使用选择目标文件的字段（`object_path`、`arch`、`uuid`、`debug_dirs`、`verbose`）。`load_address` 和 `file_offsets` 改为在每次调用 `symbolize` 时传入；`addresses`、`format`、`input` 和 `inline_frames` 会被忽略。
+- 每次调用返回的 `SymbolizeOutcome` 与 `symbolize_path` 对同一地址的结果相同。`object_path()`、`object_name()` 和 `selected_slice()` 提供报告级别的字段。
+- 编译单元在首次用到时才解析，因此查找的范围越大，占用的内存越多。缓存多个符号化器时请限制数量。
+- `ObjectSymbolizer` 实现了 `Send` 但没有实现 `Sync`。需要在线程间共享时，请用 `Mutex` 包装。
+
 ## 稳定性
 
 `SymbolizeOptions` 派生 `Default` 意味着可以添加新的可选字段，而不会破坏使用 `..Default::default()` 的调用方。参见项目的[关于 API 兼容性的发布说明](https://github.com/everettjf/atosl-rs/blob/main/RELEASING.md#public-api-compatibility)。
